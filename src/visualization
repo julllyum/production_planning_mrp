@@ -1,0 +1,217 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import psycopg2
+import os
+
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": int(os.getenv("DB_PORT", "5432")),
+    "database": os.getenv("DB_NAME", "postgres"),
+    "user": os.getenv("DB_USER", "postgres"),
+    "password": os.getenv("DB_PASSWORD")
+}
+SCHEMA = "SupplyChain"
+
+# цвета по номеру заказа
+ORDER_COLORS = {
+    1008: '#f8c8dc',  # розовый
+    1002: '#ffd8b1',  # персиковый
+    1004: '#fff7b2',  # нежно-желтый
+    1001: '#c8f7dc',  # мятный
+    1003: '#cceeff',  # небесный
+    1007: '#d6e6ff',  # светло-синий
+    1005: '#e6d6ff',  # светло-фиолетовый
+    1006: '#c8a2ff'   # фиолетовый
+}
+
+# порядок агрегатов
+RESOURCE_ORDER = [
+    'Прокатный стан г/п',
+    'Прокатный стан х/п',
+    'Агрегат резки',
+    'Линия упаковки',
+    'Агрегат травления',
+    'Линия АНО',
+    'Отжиг в КП',
+    'Линия дрессировки'
+]
+
+MIXED_COLOR = '#d3d3d3'   # цвет для ячеек, где в один день на ресурсе несколько заказов
+
+def get_connection():
+    return psycopg2.connect(**DB_CONFIG)
+
+
+
+def set_schema(conn):
+    with conn.cursor() as cur:
+        cur.execute(f'SET search_path TO "{SCHEMA}";')
+    conn.commit()
+
+
+
+def load_calendar_data(conn):
+    query = f"""
+        SELECT 
+            m.ready_date,
+            r.resource_desc AS resource,
+            m.required_hours,
+            m.sales_order_id
+        FROM {SCHEMA}.MRP_Plan m
+        JOIN {SCHEMA}.Resource r ON m.resource_id = r.resource_id
+        WHERE m.required_hours > 0
+        ORDER BY m.ready_date, r.resource_desc
+    """
+
+    df = pd.read_sql(query, conn)
+    df['ready_date'] = pd.to_datetime(df['ready_date']).dt.date
+    return df
+
+
+
+def prepare_pivot(df):
+    # таблица часов
+    pivot_hours = df.pivot_table(
+        index='resource',
+        columns='ready_date',
+        values='required_hours',
+        aggfunc='sum',
+        fill_value=0
+    )
+
+    # таблица заказов для цветов (количество уникальных заказов)
+    pivot_unique_orders = df.pivot_table(
+        index='resource',
+        columns='ready_date',
+        values='sales_order_id',
+        aggfunc='nunique',
+        fill_value=0
+    )
+    # ID заказа для случая, когда заказ один
+    pivot_order_id = df.pivot_table(
+        index='resource',
+        columns='ready_date',
+        values='sales_order_id',
+        aggfunc='first'
+    )
+    # порядок агрегатов
+    pivot_hours = pivot_hours.reindex(RESOURCE_ORDER)
+    pivot_unique_orders = pivot_unique_orders.reindex(RESOURCE_ORDER)
+    pivot_order_id = pivot_order_id.reindex(RESOURCE_ORDER)
+
+    return pivot_hours, pivot_unique_orders, pivot_order_id
+
+
+
+def build_color_matrix(pivot_unique_orders, pivot_order_id):
+    color_matrix = []
+    for res in pivot_unique_orders.index:
+        row_colors = []
+        for col in pivot_unique_orders.columns:
+            unique_cnt = pivot_unique_orders.loc[res, col]
+            if unique_cnt == 0:
+                row_colors.append('#ffffff')  # белый если нет данных
+            elif unique_cnt > 1:
+                row_colors.append(MIXED_COLOR)  # серый для смешанных заказов
+            else:   # ровно один заказ
+                order_id = pivot_order_id.loc[res, col]
+                if pd.notna(order_id):
+                    row_colors.append(ORDER_COLORS.get(int(order_id), '#dddddd'))
+                else:
+                    row_colors.append('#ffffff')
+        color_matrix.append(row_colors)
+    return color_matrix
+
+
+
+def draw_calendar(pivot_hours, pivot_unique_orders, pivot_order_id):
+    dates = sorted(pivot_hours.columns)
+    date_labels = [d.strftime('%d.%m') for d in dates]
+
+    annot_data = pivot_hours.round(1).astype(str)
+    annot_data[pivot_hours == 0] = ''
+
+    n_days = len(dates)
+    n_res = pivot_hours.shape[0]
+
+    fig_width = max(10, n_days * 0.5)
+    fig_height = max(6, n_res * 0.6)
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    color_matrix = build_color_matrix(pivot_unique_orders, pivot_order_id)
+
+    # рисуем цветные ячейки
+    for y in range(n_res):
+        for x in range(n_days):
+            rect = plt.Rectangle(
+                (x, y),
+                1,
+                1,
+                facecolor=color_matrix[y][x],
+                edgecolor='lightgray',
+                linewidth=0.5
+            )
+            ax.add_patch(rect)
+
+    # текст часов
+    for y in range(n_res):
+        for x in range(n_days):
+            text = annot_data.iloc[y, x]
+            if text != '':
+                ax.text(
+                    x + 0.5,
+                    y + 0.5,
+                    text,
+                    ha='center',
+                    va='center',
+                    fontsize=9
+                )
+
+    ax.set_xlim(0, n_days)
+    ax.set_ylim(n_res, 0)
+
+    ax.set_xticks([i + 0.5 for i in range(n_days)])
+    ax.set_yticks([i + 0.5 for i in range(n_res)])
+
+    ax.set_xticklabels(date_labels, rotation=45, ha='right', fontsize=9)
+    ax.set_yticklabels(pivot_hours.index, rotation=0, fontsize=9)
+
+    ax.set_title('Календарь загрузки агрегатов', fontsize=14, pad=20)
+    ax.set_xlabel('Дата')
+    ax.set_ylabel('Ресурс')
+
+    plt.tight_layout()
+    plt.savefig('calendar_heatmap.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    print('календарь сохранён: calendar_heatmap.png')
+
+
+
+def main():
+    conn = get_connection()
+
+    try:
+        set_schema(conn)
+
+        df = load_calendar_data(conn)
+
+        if df.empty:
+            print('нет данных в MRP_Plan. сначала выполните MRP расчёт.')
+            return
+
+        pivot_hours, pivot_unique_orders, pivot_order_id = prepare_pivot(df)
+
+        draw_calendar(pivot_hours, pivot_unique_orders, pivot_order_id)
+
+        print('визуализация завершена.')
+
+
+    finally:
+        conn.close()
+
+
+
+if __name__ == "__main__":
+    main()
